@@ -223,3 +223,35 @@ def main():
 
 if __name__ == '__main__':
     main()
+# ================= 步数模拟（保留） =================
+import random
+
+def get_headers(header_raw):
+    return dict(line.split(": ", 1) for line in header_raw.split("\n") if line != '')
+
+headers_str = '''
+accept: application/json, text/javascript, */*; q=0.01
+accept-language: zh-CN,zh;q=0.9
+content-type: application/x-www-form-urlencoded;charset=UTF-8
+Accept-Encoding: gzip, deflate
+Connection: keep-alive
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
+'''
+headers = get_headers(headers_str)
+
+message_dict = {'dlc@163.com': 'chenazx123'}
+
+for key, value in message_dict.items():
+    step = random.randint(2000, 8600)
+    data = {
+        "referrer": "http://bs.yanwan.store/",
+        "referrerPolicy": "strict-origin-when-cross-origin",
+        "method": "POST",
+        "mode": "cors",
+        "credentials": "omit",
+        "user": "%s" % key,
+        "password": "%s" % value,
+        "step": "%s" % step,
+        "ver": "cxydzsv3.2"
+    }
+    response = requests.post(url="http://yanwan.store/run4/mi.php", headers=headers, data=data)
