@@ -34,6 +34,8 @@ jobs:
         env:
           GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          STEP_USER: ${{ secrets.STEP_USER }}
+          STEP_PASSWORD: ${{ secrets.STEP_PASSWORD }}
 
       - name: Retry on Failure
         if: failure()
@@ -45,3 +47,5 @@ jobs:
         env:
           GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          STEP_USER: ${{ secrets.STEP_USER }}
+          STEP_PASSWORD: ${{ secrets.STEP_PASSWORD }}
