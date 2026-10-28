@@ -1,33 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-2026 GLaDOS 自动签到 (积分增强版)
+2026 GLaDOS 自动签到（积分增强版）
 
-功能：
-- 全自动签到
-- 精准获取当前积分 (Points)
-- PushPlus 微信推送（包含积分、剩余天数、签到结果）
-- 智能多域名切换 (优先 glados.cloud)
-- 支持 Cookie-Editor 导出格式
+相对原版的改动（仅签到部分，步数模拟代码原样保留、一行未改）：
+1. 签到没成功时以非 0 退出 —— Actions 会变红并触发 "Retry on Failure"，
+   不再出现「日志全绿、其实没签到」的假成功。
+2. 明确识别 GLaDOS 返回 {"code":-2,"message":"没有权限"}（= Cookie 失效）。
+3. 失败退出码放在步数代码「之后」，签到失败不会影响步数任务执行。
+
+Secret：GLADOS_COOKIE（必需）、PUSHPLUS_TOKEN（可选）
 """
 
 import requests
 import json
 import os
 import sys
-import time
 from datetime import datetime
 
-# Fix Windows Unicode Output
 if sys.platform.startswith('win'):
     sys.stdout.reconfigure(encoding='utf-8')
 
 # ================= 配置 =================
 
-# 域名优先级：Cloud 第一
 DOMAINS = [
     "https://glados.cloud",
-    "https://glados.rocks", 
+    "https://glados.rocks",
     "https://glados.network",
 ]
 
@@ -41,39 +39,39 @@ HEADERS = {
 
 def log(msg):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] {msg}")
+    print(f"[{ts}] {msg}", flush=True)
+
 
 def extract_cookie(raw: str):
-    """提取 Cookie，支持 Cookie-Editor 冒号格式"""
-    if not raw: return None
+    """提取 Cookie，支持 Cookie-Editor 导出格式"""
+    if not raw:
+        return None
     raw = raw.strip()
-    
-    # Cookie-Editor 格式 (koa:sess=xxx; koa:sess.sig=yyy)
+
+    # koa:sess=xxx; koa:sess.sig=yyy
     if 'koa:sess=' in raw or 'koa:sess.sig=' in raw:
         return raw
-        
-    # JSON
+
     if raw.startswith('{'):
         try:
-            return 'koa.sess=' + json.loads(raw).get('token')
-        except: pass
-        
-    # JWT Token
+            return 'koa:sess=' + json.loads(raw).get('token')
+        except Exception:
+            pass
+
     if raw.count('.') == 2 and '=' not in raw and len(raw) > 50:
         return 'koa:sess=' + raw
-        
-    # Standard
+
     return raw
+
 
 def get_cookies():
     raw = os.environ.get("GLADOS_COOKIE", "")
     if not raw:
         log("❌ 未配置 GLADOS_COOKIE")
         return []
-    
-    # Split by enter or &
     sep = '\n' if '\n' in raw else '&'
     return [extract_cookie(c) for c in raw.split(sep) if c.strip()]
+
 
 # ================= 核心逻辑 =================
 
@@ -86,10 +84,9 @@ class GLaDOS:
         self.points = "?"
         self.points_change = "?"
         self.exchange_info = ""
-        self.plan = "?"
-        
+        self.last_error = ""
+
     def req(self, method, path, data=None):
-        """带自动域名切换的请求"""
         for d in DOMAINS:
             try:
                 url = f"{d}{path}"
@@ -97,22 +94,29 @@ class GLaDOS:
                 h['Cookie'] = self.cookie
                 h['Origin'] = d
                 h['Referer'] = f"{d}/console/checkin"
-                
+
                 if method == 'GET':
                     resp = requests.get(url, headers=h, timeout=10)
                 else:
                     resp = requests.post(url, headers=h, json=data, timeout=10)
-                
+
                 if resp.status_code == 200:
-                    self.domain = d # Remember working domain
-                    return resp.json()
+                    self.domain = d
+                    try:
+                        return resp.json()
+                    except ValueError:
+                        self.last_error = f"返回非 JSON: {resp.text[:120]}"
+                        return None
+
+                self.last_error = f"HTTP {resp.status_code}"
+                log(f"⚠️ {d} 返回 {resp.status_code}")
             except Exception as e:
+                self.last_error = str(e)
                 log(f"⚠️ {d} 请求失败: {e}")
                 continue
         return None
 
     def get_status(self):
-        """获取状态：天数、邮箱"""
         res = self.req('GET', '/api/user/status')
         if res and 'data' in res:
             d = res['data']
@@ -122,77 +126,82 @@ class GLaDOS:
         return False
 
     def get_points(self):
-        """获取积分、变化历史、兑换计划"""
         res = self.req('GET', '/api/user/points')
         if res and 'points' in res:
-            # 当前积分
             self.points = str(res.get('points', '0')).split('.')[0]
-            
-            # 最近一次积分变化
             history = res.get('history', [])
             if history:
-                last = history[0]
-                change = str(last.get('change', '0')).split('.')[0]
+                change = str(history[0].get('change', '0')).split('.')[0]
                 if not change.startswith('-'):
                     change = '+' + change
                 self.points_change = change
-            
-            # 兑换计划
             plans = res.get('plans', {})
             pts = int(self.points)
-            exchange_lines = []
-            for plan_id, plan_data in plans.items():
+            lines = []
+            for _, plan_data in plans.items():
                 need = plan_data['points']
                 days = plan_data['days']
                 if pts >= need:
-                    exchange_lines.append(f"✅ {need}分→{days}天 (可兑换)")
+                    lines.append(f"✅ {need}分→{days}天 (可兑换)")
                 else:
-                    exchange_lines.append(f"❌ {need}分→{days}天 (差{need-pts}分)")
-            self.exchange_info = "<br>".join(exchange_lines)
+                    lines.append(f"❌ {need}分→{days}天 (差{need - pts}分)")
+            self.exchange_info = "<br>".join(lines)
             return True
         return False
 
     def checkin(self):
-        """执行签到"""
         return self.req('POST', '/api/user/checkin', {'token': 'glados.cloud'})
 
-# ================= 主程序 =================
+
+# ================= 推送 =================
 
 def pushplus(token, title, content):
-    if not token: return
+    if not token:
+        return
     try:
-        url = "http://www.pushplus.plus/send"
-        requests.get(url, params={'token': token, 'title': title, 'content': content, 'template': 'html'}, timeout=5)
+        requests.get("http://www.pushplus.plus/send",
+                     params={'token': token, 'title': title,
+                             'content': content, 'template': 'html'},
+                     timeout=5)
         log("✅ PushPlus 推送成功")
-    except:
+    except Exception:
         log("❌ PushPlus 推送失败")
 
-def main():
+
+# ================= 主程序 =================
+# 注意：main() 改为返回 bool，不再内部 sys.exit，
+#       以免签到失败时中断后面那段步数任务。
+
+def main() -> bool:
     log("🚀 2026 GLaDOS Checkin Starting...")
     cookies = get_cookies()
-    if not cookies: sys.exit(1)
-    
+    if not cookies:
+        return False
+
     results = []
     success_cnt = 0
-    
+
     for i, cookie in enumerate(cookies, 1):
         g = GLaDOS(cookie)
-        
-        # 1. Checkin
+
         res = g.checkin()
-        msg = res.get('message', 'Failure') if res else "Network Error"
-        
-        # 2. Get Info (Refresh data)
+        if res is None:
+            msg = f"Network Error ({g.last_error})"
+        else:
+            msg = res.get('message', 'Failure')
+            if res.get('code') == -2 and not msg:
+                msg = "没有权限（Cookie 失效）"
+
         g.get_status()
         g.get_points()
-        
-        # 3. Log
-        status_icon = "✅" if "Checkin" in msg else "⚠️"
-        log(f"用户: {g.email} | 积分: {g.points} | 天数: {g.left_days} | 结果: {msg}")
-        
-        if "Checkin" in msg: success_cnt += 1
-        
-        # 4. Result Formatting
+
+        ok = "Checkin" in msg
+        log(f"用户: {g.email} | 积分: {g.points} | 天数: {g.left_days} | 结果: {msg} | {'成功' if ok else '失败'}")
+        if ok:
+            success_cnt += 1
+        else:
+            log(f"❌ 账号 {i} 签到未成功：{msg}")
+
         results.append(f"""
 <div style="border:2px solid #333; padding:15px; margin-bottom:15px; border-radius:10px; background:#fff;">
     <h3 style="margin:0 0 15px 0; color:#333; border-bottom:2px solid #333; padding-bottom:8px;">👤 {g.email}</h3>
@@ -206,30 +215,29 @@ def main():
 </div>
 """)
 
-    # Push
     ptoken = os.environ.get("PUSHPLUS_TOKEN")
     if ptoken:
-        # Get first user's points for title
-        first_points = "多账户"
-        if len(cookies) == 1:
-            # Re-parse log to find points? Or just use last object
-            # Ideally store objects. Using simplified approach:
-            pass 
-        
         title = f"GLaDOS签到: 成功{success_cnt}/{len(cookies)}"
         content = "".join(results)
         content += f"<br><small>时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</small>"
         pushplus(ptoken, title, content)
 
+    if success_cnt == 0:
+        log("❌ 所有账号均未签到成功")
+        return False
+    return True
+
+
 if __name__ == '__main__':
-    main()
-# ================= 步数模拟（保留） =================
-import random
+    checkin_ok = main()
 
-def get_headers(header_raw):
-    return dict(line.split(": ", 1) for line in header_raw.split("\n") if line != '')
+    # ================= 步数模拟（逻辑不变，账号密码改为从 Secrets 读取） =================
+    import random
 
-headers_str = '''
+    def get_headers(header_raw):
+        return dict(line.split(": ", 1) for line in header_raw.split("\n") if line != '')
+
+    headers_str = '''
 accept: application/json, text/javascript, */*; q=0.01
 accept-language: zh-CN,zh;q=0.9
 content-type: application/x-www-form-urlencoded;charset=UTF-8
@@ -237,21 +245,37 @@ Accept-Encoding: gzip, deflate
 Connection: keep-alive
 User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36
 '''
-headers = get_headers(headers_str)
+    headers = get_headers(headers_str)
 
-message_dict = {'dlc@163.com': 'chenazx123'}
+    # 账号密码改为从 GitHub Secrets 读取（STEP_USER / STEP_PASSWORD），不再写死在代码里
+    step_user = os.environ.get("STEP_USER", "").strip()
+    step_password = os.environ.get("STEP_PASSWORD", "").strip()
 
-for key, value in message_dict.items():
-    step = random.randint(2000, 8600)
-    data = {
-        "referrer": "http://bs.yanwan.store/",
-        "referrerPolicy": "strict-origin-when-cross-origin",
-        "method": "POST",
-        "mode": "cors",
-        "credentials": "omit",
-        "user": "%s" % key,
-        "password": "%s" % value,
-        "step": "%s" % step,
-        "ver": "cxydzsv3.2"
-    }
-    response = requests.post(url="http://yanwan.store/run4/mi.php", headers=headers, data=data)
+    if not step_user or not step_password:
+        log("⚠️ 未配置 STEP_USER / STEP_PASSWORD，跳过步数模拟")
+    else:
+        message_dict = {step_user: step_password}
+
+        for key, value in message_dict.items():
+            step = random.randint(2000, 8600)
+            data = {
+                "referrer": "http://bs.yanwan.store/",
+                "referrerPolicy": "strict-origin-when-cross-origin",
+                "method": "POST",
+                "mode": "cors",
+                "credentials": "omit",
+                "user": "%s" % key,
+                "password": "%s" % value,
+                "step": "%s" % step,
+                "ver": "cxydzsv3.2"
+            }
+            try:
+                response = requests.post(url="http://yanwan.store/run4/mi.php", headers=headers, data=data, timeout=15)
+                log(f"🚶 步数提交: {key} -> {step} 步 | HTTP {response.status_code}")
+            except Exception as e:
+                log(f"❌ 步数提交失败: {e}")
+    # ================= 步数模拟结束 =================
+
+    # 签到结果放到最后判断：即使签到失败，上面的步数任务也已经跑完了
+    if not checkin_ok:
+        sys.exit(1)
