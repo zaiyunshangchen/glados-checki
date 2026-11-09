@@ -1,19 +1,22 @@
 name: GLaDOS 2026 Checkin
 
+# 拟人化设计：一天只签一次、时间随机、只在白天。
+# 不需要再用 cron-job.org 外部触发 —— 那个是秒级固定时间，机器特征太明显。
+
 on:
   schedule:
-    # 北京时间 9:30 (UTC 1:30)
-    - cron: '30 1 * * *'
-    # 北京时间 21:30 (UTC 13:30)
-    - cron: '30 13 * * *'
-  workflow_dispatch:  # 允许手动触发
-  push:
-    branches: [main]  # 推送时也触发，保持活跃
+    # GitHub 的 scheduled 任务会延迟 0～9 小时不等，所以铺三条，
+    # 保证至少有一条落在脚本允许的签到时段（北京时间 06:00–24:00）内。
+    # 脚本自身还有「今天签过就跳过」的守卫，多触发不会重复签到。
+    - cron: '10 22 * * *'   # UTC 22:10 = 北京 06:10
+    - cron: '10 2 * * *'    # UTC 02:10 = 北京 10:10
+    - cron: '10 8 * * *'    # UTC 08:10 = 北京 16:10
+  workflow_dispatch:        # 仅用于手动测试
 
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -33,7 +36,7 @@ jobs:
         id: checkin
         continue-on-error: true
         run: python checkin.py
-        timeout-minutes: 5
+        timeout-minutes: 45
         env:
           GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
@@ -51,7 +54,7 @@ jobs:
           echo "First attempt failed, retrying in 60s..."
           sleep 60
           python checkin.py
-        timeout-minutes: 5
+        timeout-minutes: 10
         env:
           GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
@@ -60,8 +63,9 @@ jobs:
           MAIL_USER: ${{ secrets.MAIL_USER }}
           MAIL_PASS: ${{ secrets.MAIL_PASS }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
+          SKIP_DELAY: '1'   # 重试不再随机等待，避免拖到超时
 
-      # 只有两次都失败才把整个 job 判红 —— 这样 GitHub 的失败邮件只在真失败时发一次
+      # 只有两次都失败才把整个 job 判红 —— GitHub 的失败邮件只在真失败时发一次
       - name: Fail if both attempts unsuccessful
         if: steps.checkin.outcome == 'failure' && steps.retry.outcome == 'failure'
         run: |
