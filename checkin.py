@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-2026 GLaDOS 自动签到（积分增强版）
+2026 GLaDOS 自动签到（拟人化版本）
 
 相对原版的改动（仅签到部分，步数模拟代码原样保留、一行未改）：
-1. 签到没成功时以非 0 退出 —— Actions 会变红并触发 "Retry on Failure"，
+1. 一天只签到一次：先查积分流水，今天已有签到记录就直接跳过，不再发签到请求。
+2. 签到前随机等待 1～30 分钟，避免落在固定秒数上（机器特征）。
+3. 只在北京时间 07:00–23:00 签到，凌晨触发直接跳过，符合正常作息。
+4. 签到没成功时以非 0 退出 —— Actions 会变红并触发 "Retry on Failure"，
    不再出现「日志全绿、其实没签到」的假成功。
-2. 明确识别 GLaDOS 返回 {"code":-2}（Cookie 失效）与 {"code":4,"reason":"device-mismatch"}
+5. 明确识别 GLaDOS 返回 {"code":-2}（Cookie 失效）与 {"code":4,"reason":"device-mismatch"}
    （UA 被判定为机器人），都会给出明确原因。
-3. Cookie 名兼容：GLaDOS 已把 koa:sess 改名为 gld:sess，旧的 koa 名字不再被识别，
+6. Cookie 名兼容：GLaDOS 已把 koa:sess 改名为 gld:sess，旧的 koa 名字不再被识别，
    脚本会自动把 koa:sess 改写为 gld:sess。
-4. {"code":1,"message":"Today's observation logged..."} = 今日已签到，算成功，不误报失败。
-5. 失败退出码放在步数代码「之后」，签到失败不会影响步数任务执行。
+7. {"code":1,"message":"Today's observation logged..."} = 今日已签到，算成功，不误报失败。
+8. 失败退出码放在步数代码「之后」，签到失败不会影响步数任务执行。
 
 Secret：GLADOS_COOKIE（必需）、PUSHPLUS_TOKEN（可选）
 """
@@ -20,8 +23,10 @@ import requests
 import json
 import os
 import sys
+import time
+import random
 import smtplib
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.header import Header
 from email.utils import formataddr
@@ -30,6 +35,16 @@ if sys.platform.startswith('win'):
     sys.stdout.reconfigure(encoding='utf-8')
 
 # ================= 配置 =================
+
+# 签到时段（北京时间整点，左闭右开）：只有落在 06:00–24:00 才会签
+# 凌晨 0–6 点不签，那是明显的机器时间
+CHECKIN_WINDOW = (6, 24)
+
+# 签到前随机等待的秒数范围，模拟真人不会在固定秒数上点按钮
+RANDOM_DELAY_RANGE = (60, 1800)
+
+# 重试时跳过随机等待，避免一次失败把 job 拖到超时
+SKIP_DELAY = os.environ.get("SKIP_DELAY", "") == "1"
 
 DOMAINS = [
     "https://glados.cloud",
@@ -46,8 +61,13 @@ HEADERS = {
 
 # ================= 工具函数 =================
 
+def beijing_now():
+    """GitHub runner 是 UTC，GLaDOS 的签到按北京时间的自然日算"""
+    return (datetime.now(timezone.utc) + timedelta(hours=8)).replace(tzinfo=None)
+
+
 def log(msg):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ts = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
 
 
@@ -111,6 +131,8 @@ class GLaDOS:
         self.last_error = ""
         self.auth_error = ""
         self.dead = set()
+        self.today_done = False       # 今天是否已经签到过
+        self.today_change = ""        # 今天签到得到的积分
 
     def req(self, method, path, data=None):
         # 优先用上次成功的域名，已判定连不上的域名直接跳过，避免重复等超时
@@ -173,6 +195,19 @@ class GLaDOS:
         if res and 'points' in res:
             self.points = str(res.get('points', '0')).split('.')[0]
             history = res.get('history', [])
+
+            # 积分流水里带 system:checkin 且 detail 是今天的日期，说明今天已经签过。
+            # 靠这个判断，可以在重复触发时直接退出，不再多发一次签到请求。
+            today = beijing_now().strftime('%Y-%m-%d')
+            self.today_done = False
+            self.today_change = ""
+            for h in history:
+                if h.get('business') == 'system:checkin' and h.get('detail') == today:
+                    self.today_done = True
+                    c = str(h.get('change', '0')).split('.')[0]
+                    self.today_change = c if c.startswith('-') else '+' + c
+                    break
+
             if history:
                 change = str(history[0].get('change', '0')).split('.')[0]
                 if not change.startswith('-'):
@@ -245,7 +280,14 @@ def send_mail(subject, body):
 #       以免签到失败时中断后面那段步数任务。
 
 def main() -> bool:
-    log("🚀 2026 GLaDOS Checkin Starting...")
+    log(f"🚀 2026 GLaDOS Checkin Starting... 北京时间 {beijing_now():%Y-%m-%d %H:%M:%S}")
+
+    # 时段守卫：凌晨触发直接跳过，符合正常作息
+    if not (CHECKIN_WINDOW[0] <= beijing_now().hour < CHECKIN_WINDOW[1]):
+        log(f"🌙 当前不在签到时段 {CHECKIN_WINDOW[0]:02d}:00–{CHECKIN_WINDOW[1]:02d}:00，"
+            f"本次跳过（不算失败）")
+        return True
+
     cookies = get_cookies()
     if not cookies:
         return False
@@ -253,11 +295,31 @@ def main() -> bool:
     results = []
     summary = []
     success_cnt = 0
+    slept = False
 
     for i, cookie in enumerate(cookies, 1):
         g = GLaDOS(cookie)
 
-        res = g.checkin()
+        # 先只读状态：积分流水里今天已有签到记录，就不再发签到请求
+        g.get_status()
+        g.get_points()
+        already_done = g.today_done
+
+        if already_done:
+            res = {'code': 1, 'message': f"今日已签到（{g.today_change} 分），不重复请求"}
+        elif g.auth_error:
+            res = None
+        else:
+            if not slept:
+                slept = True
+                if SKIP_DELAY:
+                    log("⏭️ 重试模式，跳过随机等待")
+                else:
+                    delay = random.randint(*RANDOM_DELAY_RANGE)
+                    log(f"⏳ 随机等待 {delay // 60} 分 {delay % 60} 秒后签到（避免固定秒数）")
+                    time.sleep(delay)
+            res = g.checkin()
+
         if res is None:
             # 认证失败优先报出来，不要被后面域名的网络超时盖掉
             msg = "没有权限（Cookie 失效）" if g.auth_error else f"Network Error ({g.last_error})"
@@ -278,8 +340,9 @@ def main() -> bool:
             else:
                 ok = False
 
-        g.get_status()
-        g.get_points()
+        if not already_done:
+            g.get_status()
+            g.get_points()
 
         log(f"用户: {g.email} | 积分: {g.points} | 天数: {g.left_days} | 结果: {msg} | {'成功' if ok else '失败'}")
         summary.append(f"账号{i}: {g.email} | 积分 {g.points} | 剩余 {g.left_days} 天 | 结果: {msg}")
@@ -305,7 +368,7 @@ def main() -> bool:
     if ptoken:
         title = f"GLaDOS签到: 成功{success_cnt}/{len(cookies)}"
         content = "".join(results)
-        content += f"<br><small>时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</small>"
+        content += f"<br><small>时间: {beijing_now():%Y-%m-%d %H:%M:%S}</small>"
         pushplus(ptoken, title, content)
 
     if success_cnt == 0:
@@ -315,14 +378,14 @@ def main() -> bool:
         log("👉 若结果是「设备校验未通过」，说明本次请求的 User-Agent 不像浏览器，"
             "检查是否被中间层改写了 UA")
         send_mail(
-            f"【GLaDOS】签到失败 {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            f"【GLaDOS】签到失败 {beijing_now():%Y-%m-%d %H:%M}",
             "本次签到没有成功。\n\n"
             + "\n".join(summary)
             + "\n\n可能原因：GLADOS_COOKIE 已过期。\n"
               "处理：登录 https://glados.cloud → Console → Checkin 页面，"
               "用 Cookie-Editor 复制 gld:sess 与 gld:sess.sig，"
               "更新仓库 Secret GLADOS_COOKIE。\n\n"
-            + f"运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            + f"运行时间: {beijing_now():%Y-%m-%d %H:%M:%S}\n"
         )
         return False
     return True
